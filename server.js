@@ -24,6 +24,25 @@ function detectSource(url) {
   return SOURCES.find(s => s.match.test(host)) || null;
 }
 
+// Thumbnail images are fetched server-side to avoid the browser CORS/hotlink
+// issues that come with saving a cross-origin image directly. Only proxy known
+// CDN hosts (mirroring the SOURCES check above) so this can't be used as an
+// open SSRF proxy for arbitrary URLs.
+const THUMBNAIL_HOSTS = [
+  /(?:^|\.)ytimg\.com$/i,
+  /(?:^|\.)ggpht\.com$/i,
+  /(?:^|\.)googleusercontent\.com$/i,
+  /(?:^|\.)cdninstagram\.com$/i,
+  /(?:^|\.)fbcdn\.net$/i,
+];
+
+function isAllowedThumbnailUrl(value) {
+  let u;
+  try { u = new URL(value); } catch { return false; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+  return THUMBNAIL_HOSTS.some(re => re.test(u.hostname));
+}
+
 app.use(express.static(path.join(__dirname)));
 
 const jobs = new Map();
@@ -60,6 +79,11 @@ app.get('/api/info', (req, res) => {
 
   proc.stdout.on('data', chunk => { stdout += chunk.toString(); });
   proc.stderr.on('data', chunk => { stderr += chunk.toString(); });
+
+  proc.on('error', (err) => {
+    const msg = err.code === 'ENOENT' ? 'yt-dlp is not installed or not on PATH' : `Failed to start yt-dlp: ${err.message}`;
+    res.status(500).json({ error: msg });
+  });
 
   proc.on('close', (code) => {
     if (code !== 0) {
@@ -130,6 +154,13 @@ app.get('/api/download', (req, res) => {
   proc.stdout.on('data', d => d.toString().split('\n').forEach(onLine));
   proc.stderr.on('data', d => d.toString().split('\n').forEach(onLine));
 
+  proc.on('error', (err) => {
+    jobs.delete(id);
+    const msg = err.code === 'ENOENT' ? 'yt-dlp is not installed or not on PATH' : `Failed to start yt-dlp: ${err.message}`;
+    emit({ type: 'error', msg });
+    res.end();
+  });
+
   proc.on('close', (code) => {
     if (code === 0) {
       let actualPath = tmpPath;
@@ -160,6 +191,27 @@ app.get('/api/download', (req, res) => {
       jobs.delete(id);
     }
   });
+});
+
+app.get('/api/thumbnail', async (req, res) => {
+  const { url, title } = req.query;
+  if (!url) return res.status(400).json({ error: 'Missing url' });
+  if (!isAllowedThumbnailUrl(url)) return res.status(400).json({ error: 'Unsupported thumbnail host' });
+
+  try {
+    const upstream = await fetch(url);
+    if (!upstream.ok) return res.status(502).json({ error: 'Failed to fetch thumbnail' });
+
+    const contentType = upstream.headers.get('content-type') || 'image/jpeg';
+    const ext = contentType.includes('png') ? 'png' : contentType.includes('webp') ? 'webp' : 'jpg';
+    const safeName = (title || 'thumbnail').replace(/[<>:"/\\|?*]/g, '').trim().slice(0, 100) || 'thumbnail';
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}.${ext}"`);
+    res.send(Buffer.from(await upstream.arrayBuffer()));
+  } catch {
+    res.status(500).json({ error: 'Failed to download thumbnail' });
+  }
 });
 
 app.get('/api/file/:id', (req, res) => {

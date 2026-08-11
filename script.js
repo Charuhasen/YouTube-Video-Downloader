@@ -14,11 +14,13 @@ const metaSep       = $('metaSep');
 const sourceBadge   = $('sourceBadge');
 const formatsCard   = $('formatsCard');
 const formatList    = $('formatList');
+const thumbCheck    = $('thumbCheck');
 const downloads     = $('downloads');
 const dlTemplate    = $('downloadTemplate');
 
-let currentUrl   = '';
-let currentTitle = '';
+let currentUrl       = '';
+let currentTitle     = '';
+let currentThumbnail = '';
 
 // Hostnames we accept. The server (via yt-dlp) does the real work; this is just
 // a quick client-side sanity check before hitting the API.
@@ -50,8 +52,11 @@ form.addEventListener('submit', async (e) => {
 
     if (!res.ok) { showState('hidden'); setError(data.error || 'Failed to fetch video info.'); return; }
 
-    currentTitle    = data.title;
-    thumbnail.src   = data.thumbnail || '';
+    currentTitle     = data.title;
+    currentThumbnail = data.thumbnail || '';
+    thumbnail.src    = data.thumbnail || '';
+    thumbCheck.checked  = thumbCheck.checked && !!currentThumbnail;
+    thumbCheck.disabled = !currentThumbnail;
     videoTitle.textContent    = data.title || '';
     videoUploader.textContent = data.uploader || '';
     videoDuration.textContent = data.duration  || '';
@@ -87,6 +92,8 @@ function download(fmt) {
   // Snapshot the current video so a later search doesn't change this download.
   const url   = currentUrl;
   const title = currentTitle;
+
+  if (thumbCheck.checked) downloadThumbnail(currentThumbnail, title);
 
   const item   = dlTemplate.content.firstElementChild.cloneNode(true);
   const fill   = item.querySelector('.dl-fill');
@@ -167,6 +174,12 @@ function download(fmt) {
     es.close(); // closing the stream signals the server to kill yt-dlp
     item.remove();
   });
+}
+
+function downloadThumbnail(thumbUrl, title) {
+  if (!thumbUrl) return;
+  const params = new URLSearchParams({ url: thumbUrl, title: title || 'thumbnail' });
+  triggerFileDownload(`/api/thumbnail?${params}`);
 }
 
 function triggerFileDownload(url, filename) {
