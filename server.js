@@ -13,9 +13,18 @@ const MAX_CONCURRENT = 5;
 // Supported sources. Each entry matches a URL by hostname pattern. yt-dlp does
 // the actual extraction, so adding a source here is mostly about recognising
 // the URL and labelling it in the UI.
+// `args` are extra yt-dlp flags for that source, applied to both the info and
+// the download call. YouTube needs them: yt-dlp's default player client returns
+// stream URLs that answer 403 unless a GVS PO Token is supplied, which breaks
+// downloads for many videos. The web_embedded client serves usable URLs without
+// one, so try it first and keep the defaults behind it for anything it cannot
+// reach (age-restricted or embedding-disabled videos).
 const SOURCES = [
-  { id: 'youtube',   name: 'YouTube',   match: /(?:^|\.)(youtube\.com|youtu\.be)$/i },
-  { id: 'instagram', name: 'Instagram', match: /(?:^|\.)instagram\.com$/i },
+  {
+    id: 'youtube', name: 'YouTube', match: /(?:^|\.)(youtube\.com|youtu\.be)$/i,
+    args: ['--extractor-args', 'youtube:player_client=web_embedded,default'],
+  },
+  { id: 'instagram', name: 'Instagram', match: /(?:^|\.)instagram\.com$/i, args: [] },
 ];
 
 function detectSource(url) {
@@ -56,6 +65,22 @@ function cleanupTemp(id) {
   } catch { /* tmpdir unreadable — nothing to clean */ }
 }
 
+// Map yt-dlp's stderr onto something the user can act on. When nothing matches,
+// fall back to `generic` but append yt-dlp's own ERROR line, so a failure stays
+// diagnosable instead of collapsing into one opaque message.
+function explainYtdlpError(stderr, sourceName, generic) {
+  const s = stderr || '';
+  if (/Private video|is private/i.test(s)) return 'This content is private';
+  if (/login required|rate-limit reached|sign in|account|cookies/i.test(s)) return `${sourceName} requires login to view this content`;
+  if (/HTTP Error 429|Too Many Requests/i.test(s)) return 'Too many requests — try again in a moment';
+  if (/Requested format is not available/i.test(s)) return 'That quality is not available for this video';
+  if (/ffmpeg|ffprobe/i.test(s) && /not installed|not found/i.test(s)) return 'ffmpeg is required for this download but was not found on PATH';
+  if (/HTTP Error 403|Forbidden/i.test(s)) return `${sourceName} refused the download (403). Try again, or update yt-dlp if it persists.`;
+  if (/not available/i.test(s)) return 'Not available in your region';
+  const line = s.split(/\r?\n/).map(l => l.trim()).filter(l => /^ERROR/i.test(l)).pop();
+  return line ? `${generic} (${line.slice(0, 160)})` : generic;
+}
+
 function activeJobCount() {
   let n = 0;
   for (const job of jobs.values()) if (!job.done) n++;
@@ -73,7 +98,7 @@ app.get('/api/info', (req, res) => {
     });
   }
 
-  const proc = spawn(YTDLP, ['--dump-json', '--no-playlist', '--no-warnings', url]);
+  const proc = spawn(YTDLP, ['--dump-json', '--no-playlist', '--no-warnings', ...(source.args || []), url]);
   let stdout = '';
   let stderr = '';
 
@@ -87,11 +112,8 @@ app.get('/api/info', (req, res) => {
 
   proc.on('close', (code) => {
     if (code !== 0) {
-      const msg = stderr.includes('Private video') || stderr.includes('private') ? 'This content is private'
-        : /login required|rate-limit reached|account|cookies/i.test(stderr) ? `${source.name} requires login to view this content`
-        : stderr.includes('not available') ? 'Not available in your region'
-        : stderr.includes('429') ? 'Too many requests — try again in a moment'
-        : 'Could not fetch info. Check the URL and try again.';
+      if (stderr.trim()) console.error(`[info] yt-dlp exited ${code}: ${stderr.trim()}`);
+      const msg = explainYtdlpError(stderr, source.name, 'Could not fetch info. Check the URL and try again.');
       return res.status(400).json({ error: msg });
     }
     try {
@@ -114,7 +136,8 @@ app.get('/api/info', (req, res) => {
 app.get('/api/download', (req, res) => {
   const { url, format, ext, title } = req.query;
   if (!url || !format) return res.status(400).json({ error: 'Missing url or format' });
-  if (!detectSource(url)) return res.status(400).json({ error: 'Unsupported URL' });
+  const source = detectSource(url);
+  if (!source) return res.status(400).json({ error: 'Unsupported URL' });
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -139,9 +162,9 @@ app.get('/api/download', (req, res) => {
 
   const args = isAudio
     ? ['--no-playlist', '-f', format, '--extract-audio', '--audio-format', 'mp3',
-       '--audio-quality', '0', '--newline', '-o', tmpPath, url]
+       '--audio-quality', '0', '--newline', ...(source.args || []), '-o', tmpPath, url]
     : ['--no-playlist', '-f', format, '--merge-output-format', 'mp4',
-       '--newline', '-o', tmpPath, url];
+       '--newline', ...(source.args || []), '-o', tmpPath, url];
 
   const proc = spawn(YTDLP, args);
   jobs.set(id, { proc, tmpPath, filename, done: false });
@@ -151,8 +174,13 @@ app.get('/api/download', (req, res) => {
     if (m) emit({ type: 'progress', pct: parseFloat(m[1]), size: m[2].trim(), speed: m[3].trim(), eta: m[4] });
   };
 
+  let stderr = '';
   proc.stdout.on('data', d => d.toString().split('\n').forEach(onLine));
-  proc.stderr.on('data', d => d.toString().split('\n').forEach(onLine));
+  proc.stderr.on('data', d => {
+    const text = d.toString();
+    stderr += text;
+    text.split('\n').forEach(onLine);
+  });
 
   proc.on('error', (err) => {
     jobs.delete(id);
@@ -161,7 +189,10 @@ app.get('/api/download', (req, res) => {
     res.end();
   });
 
+  let cancelled = false;
+
   proc.on('close', (code) => {
+    if (cancelled) return; // client hung up; the response is already closed
     if (code === 0) {
       let actualPath = tmpPath;
       if (!fs.existsSync(tmpPath)) {
@@ -178,7 +209,8 @@ app.get('/api/download', (req, res) => {
     } else {
       cleanupTemp(id);
       jobs.delete(id);
-      emit({ type: 'error', msg: 'Download failed. The format may not be available.' });
+      if (stderr.trim()) console.error(`[download ${id}] yt-dlp exited ${code}: ${stderr.trim()}`);
+      emit({ type: 'error', msg: explainYtdlpError(stderr, source.name, 'Download failed.') });
     }
     res.end();
   });
@@ -186,6 +218,7 @@ app.get('/api/download', (req, res) => {
   req.on('close', () => {
     const job = jobs.get(id);
     if (job && !job.done) {
+      cancelled = true;
       proc.kill('SIGTERM');
       cleanupTemp(id);
       jobs.delete(id);
@@ -234,6 +267,23 @@ function formatDuration(secs) {
   return h ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
+// Build a yt-dlp format selector, optionally capped at a height. Separate
+// video+audio streams are preferred over progressive ones throughout: YouTube
+// serves its progressive formats (e.g. 18) from URLs that answer 403, so any
+// selector that can land on a bare `best` fails on most videos. Progressive is
+// kept only as the last resort, for sources that offer nothing else.
+function videoSelector(maxHeight) {
+  const cap = maxHeight ? `[height<=${maxHeight}]` : '';
+  return [
+    `bestvideo${cap}[vcodec^=avc1]+bestaudio[ext=m4a]`,
+    `bestvideo${cap}[vcodec^=avc1]+bestaudio`,
+    `bestvideo${cap}[ext=mp4]+bestaudio[ext=m4a]`,
+    `bestvideo${cap}+bestaudio`,
+    `best${cap}[ext=mp4]`,
+    `best${cap}`,
+  ].join('/');
+}
+
 function buildFormats(formats) {
   const levels = [
     { h: 2160, label: '4K Ultra HD' },
@@ -242,6 +292,8 @@ function buildFormats(formats) {
     { h: 720,  label: '720p HD'  },
     { h: 480,  label: '480p'     },
     { h: 360,  label: '360p'     },
+    { h: 240,  label: '240p'     },
+    { h: 144,  label: '144p'     },
   ];
 
   const hasVideo = formats.some(f => f.vcodec && f.vcodec !== 'none');
@@ -253,12 +305,7 @@ function buildFormats(formats) {
   const result = [];
   for (const { h, label } of levels) {
     if (h <= maxH) {
-      result.push({
-        selector: `bestvideo[height<=${h}][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=${h}][vcodec^=avc1]+bestaudio/bestvideo[height<=${h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${h}]+bestaudio/best[height<=${h}]`,
-        label,
-        ext: 'mp4',
-        type: 'video'
-      });
+      result.push({ selector: videoSelector(h), label, ext: 'mp4', type: 'video' });
     }
   }
 
@@ -266,7 +313,7 @@ function buildFormats(formats) {
   // metadata, or a single progressive stream. Offer a "best quality" option so
   // the user can still grab the video.
   if (hasVideo && result.length === 0) {
-    result.push({ selector: 'best[ext=mp4]/best', label: 'Best Quality', ext: 'mp4', type: 'video' });
+    result.push({ selector: videoSelector(0), label: 'Best Quality', ext: 'mp4', type: 'video' });
   }
 
   result.push({ selector: 'bestaudio/best', label: 'MP3 Audio', ext: 'mp3', type: 'audio' });
