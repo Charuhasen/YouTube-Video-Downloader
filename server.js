@@ -33,6 +33,38 @@ function detectSource(url) {
   return SOURCES.find(s => s.match.test(host)) || null;
 }
 
+// Some videos cannot be extracted anonymously at all -- age-restricted ones in
+// particular, where every player client now answers "Sign in to confirm your
+// age". No choice of client gets around that, so the only way through is to
+// hand yt-dlp cookies from an account that can already watch the video. Two
+// ways to supply them, checked in order:
+//
+//   YTDLP_COOKIES_FROM_BROWSER=firefox  read them from a browser profile (see
+//                                       yt-dlp's docs for the full
+//                                       "browser[+keyring][:profile]" syntax)
+//   YTDLP_COOKIES=/path/to/cookies.txt  a Netscape-format cookie file
+//
+// and failing both, a cookies.txt sitting next to server.js. Cookies are
+// resolved per request rather than cached, so dropping that file in takes
+// effect without a restart. It holds live session tokens for the account, so
+// it is gitignored -- treat it the way you would a password.
+const COOKIE_FILE = path.join(__dirname, 'cookies.txt');
+
+function cookieArgs() {
+  const browser = process.env.YTDLP_COOKIES_FROM_BROWSER;
+  if (browser) return ['--cookies-from-browser', browser];
+
+  const file = process.env.YTDLP_COOKIES;
+  if (file) {
+    if (fs.existsSync(file)) return ['--cookies', file];
+    console.warn(`[cookies] YTDLP_COOKIES is set to ${file}, which does not exist -- ignoring`);
+    return [];
+  }
+
+  if (fs.existsSync(COOKIE_FILE)) return ['--cookies', COOKIE_FILE];
+  return [];
+}
+
 // Thumbnail images are fetched server-side to avoid the browser CORS/hotlink
 // issues that come with saving a cross-origin image directly. Only proxy known
 // CDN hosts (mirroring the SOURCES check above) so this can't be used as an
@@ -70,8 +102,41 @@ function cleanupTemp(id) {
 // diagnosable instead of collapsing into one opaque message.
 function explainYtdlpError(stderr, sourceName, generic) {
   const s = stderr || '';
+
+  // What to tell the user about any "we need an account" failure depends on
+  // whether cookies are configured at all, so build that half of the message
+  // once and reuse it.
+  const signIn = cookieArgs().length
+    ? 'The cookies the server is using did not get access — check they come from an account that can watch it.'
+    : 'Point the server at your browser cookies to sign in (see "Signed-in downloads" in the README).';
+
   if (/Private video|is private/i.test(s)) return 'This content is private';
-  if (/login required|rate-limit reached|sign in|account|cookies/i.test(s)) return `${sourceName} requires login to view this content`;
+
+  // Cookies misconfigured, rather than anything wrong with the video. These go
+  // first: yt-dlp fails on the options before it ever looks at the URL.
+  const browserErr = s.match(/unsupported browser specified for cookies: "([^"]*)"/i);
+  if (browserErr) {
+    return `YTDLP_COOKIES_FROM_BROWSER is set to "${browserErr[1]}", which yt-dlp does not recognise. Use one of: brave, chrome, chromium, edge, firefox, opera, safari, vivaldi, whale.`;
+  }
+  if (/does not look like a Netscape format cookies file/i.test(s)) {
+    return 'The cookie file is not in Netscape format — re-export it with a cookies.txt browser extension.';
+  }
+  if (/could not copy|failed to decrypt|unable to (open|read|decrypt)[^\n]*cookie/i.test(s)) {
+    return 'Could not read cookies from that browser — close the browser and retry, or export a cookies.txt instead.';
+  }
+  // Match on what actually failed, not on yt-dlp's trailing "Use --cookies..."
+  // hint: that hint is appended to several unrelated errors, and to a warning
+  // that fires even when an age-restricted video extracts successfully.
+  if (/Sign in to confirm your age/i.test(s)) {
+    return `This video is age-restricted, so ${sourceName} only serves it to a signed-in account. ${signIn}`;
+  }
+  if (/confirm you.?re not a bot/i.test(s)) {
+    return `${sourceName} wants to confirm you're not a bot. ${signIn}`;
+  }
+  if (/members-only|join this channel/i.test(s)) return 'This video is available to channel members only';
+  if (/login required|rate-limit reached|sign in|account required/i.test(s)) {
+    return `${sourceName} requires login to view this content. ${signIn}`;
+  }
   if (/HTTP Error 429|Too Many Requests/i.test(s)) return 'Too many requests — try again in a moment';
   if (/Requested format is not available/i.test(s)) return 'That quality is not available for this video';
   if (/ffmpeg|ffprobe/i.test(s) && /not installed|not found/i.test(s)) return 'ffmpeg is required for this download but was not found on PATH';
@@ -98,7 +163,7 @@ app.get('/api/info', (req, res) => {
     });
   }
 
-  const proc = spawn(YTDLP, ['--dump-json', '--no-playlist', '--no-warnings', ...(source.args || []), url]);
+  const proc = spawn(YTDLP, ['--dump-json', '--no-playlist', '--no-warnings', ...cookieArgs(), ...(source.args || []), url]);
   let stdout = '';
   let stderr = '';
 
@@ -162,9 +227,9 @@ app.get('/api/download', (req, res) => {
 
   const args = isAudio
     ? ['--no-playlist', '-f', format, '--extract-audio', '--audio-format', 'mp3',
-       '--audio-quality', '0', '--newline', ...(source.args || []), '-o', tmpPath, url]
+       '--audio-quality', '0', '--newline', ...cookieArgs(), ...(source.args || []), '-o', tmpPath, url]
     : ['--no-playlist', '-f', format, '--merge-output-format', 'mp4',
-       '--newline', ...(source.args || []), '-o', tmpPath, url];
+       '--newline', ...cookieArgs(), ...(source.args || []), '-o', tmpPath, url];
 
   const proc = spawn(YTDLP, args);
   jobs.set(id, { proc, tmpPath, filename, done: false });
@@ -321,5 +386,10 @@ function buildFormats(formats) {
 }
 
 app.listen(PORT, () => {
-  console.log(`\n  YouTube Downloader  →  http://localhost:${PORT}\n`);
+  const cookies = cookieArgs();
+  const note = cookies.length === 0
+    ? 'none — age-restricted videos will fail'
+    : cookies[0] === '--cookies-from-browser' ? `from browser ${cookies[1]}` : cookies[1];
+  console.log(`\n  YouTube Downloader  →  http://localhost:${PORT}`);
+  console.log(`  Cookies: ${note}\n`);
 });
